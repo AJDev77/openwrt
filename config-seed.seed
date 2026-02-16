@@ -208,3 +208,19 @@ CONFIG_PACKAGE_htop=y
 CONFIG_HTOP_LMSENSORS=n
 CONFIG_PACKAGE_socat=y
 CONFIG_PACKAGE_ethtool=y
+
+# Printing stuff
+CONFIG_PACKAGE_avahi-dbus-daemon=y
+CONFIG_PACKAGE_avahi-utils=y
+CONFIG_PACKAGE_cups=y
+CONFIG_PACKAGE_cups-client=y
+CONFIG_PACKAGE_dbus=y
+CONFIG_PACKAGE_libavahi-client=y
+CONFIG_PACKAGE_libavahi-dbus-support=y
+CONFIG_PACKAGE_libcups=y
+CONFIG_PACKAGE_libcupsimage=y
+CONFIG_PACKAGE_liberation-fonts=y
+CONFIG_PACKAGE_openprinting-cups-filters=y
+CONFIG_PACKAGE_poppler=y
+CONFIG_PACKAGE_qpdf=y
+CONFIG_PACKAGE_ubuntu-fonts=y
