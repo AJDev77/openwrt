@@ -29,9 +29,9 @@ jobs:
                   swig \
                   unzip \
                   zlib1g-dev \
+                  libglib2.0-dev-bin \
                   file \
                   wget && \
-                  libglib2.0-dev-bin && \
                   sudo apt-get clean
                   
             - name: Checkout
