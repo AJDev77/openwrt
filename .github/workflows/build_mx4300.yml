@@ -39,7 +39,7 @@ jobs:
                 ref: ${{ github.event.ref }}
 
             - name: Add cups feed
-              run: cp feeds.conf.default feeds.conf && echo "src-git printing git://github.com/AJDev77/openwrt-printing-packages.git" >> feeds.conf
+              run: cp feeds.conf.default feeds.conf && echo "src-git printing https://github.com/AJDev77/openwrt-printing-packages.git" >> feeds.conf
 
             - name: Update feeds
               run:  scripts/feeds update -a && scripts/feeds install -a
