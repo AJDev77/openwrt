@@ -31,6 +31,7 @@ jobs:
                   zlib1g-dev \
                   file \
                   wget && \
+                  libglib2.0-dev-bin && \
                   sudo apt-get clean
                   
             - name: Checkout
