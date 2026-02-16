@@ -4,7 +4,7 @@ on: workflow_dispatch
 
 jobs:
     build:
-        name: Build Linksys MX4200/MX4300 Images
+        name: Build Linksys MX4300 Images
         runs-on: ubuntu-latest
         permissions:
             contents: write
@@ -38,6 +38,9 @@ jobs:
               with:
                 ref: ${{ github.event.ref }}
 
+            - name: Add cups feed
+              run: cp feeds.conf.default feeds.conf && echo "src-git printing git://github.com/AJDev77/openwrt-printing-packages.git" >> feeds.conf
+
             - name: Update feeds
               run:  scripts/feeds update -a && scripts/feeds install -a
 
@@ -51,16 +54,16 @@ jobs:
               run:  cat .config
 
             - name: Generate full config
-              run:  make defconfig V=s
+              run:  make defconfig
 
             - name: Print final config we are using
               run: cat .config
 
             - name: Pre-download
-              run: make download -j$(nproc) V=s
+              run: make download -j$(($(nproc)+1))
 
             - name: Build firmware images
-              run: make -j5 V=s
+              run: make -j$(($(nproc)+1)) V=s
 
             - name: Get SHA
               uses: benjlevesque/short-sha@v2.2
