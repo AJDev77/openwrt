@@ -27,7 +27,7 @@ base-commit: 12f167f02a1abe2c8817496a902de00758285b92
  	struct ath11k_dp *dp = &ab->dp;
  	int hal_ring_id = dp->tx_ring[ring_id].tcl_comp_ring.ring_id;
  	struct hal_srng *status_ring = &ab->hal.srng_list[hal_ring_id];
-+	bool mac_id_scheduled[MAX_RADIOS];
++	bool mac_id_scheduled[MAX_RADIOS] = {false};
  	struct sk_buff *msdu;
  	struct hal_tx_status ts = {};
  	struct dp_tx_ring *tx_ring = &dp->tx_ring[ring_id];
