@@ -209,6 +209,8 @@ CONFIG_HTOP_LMSENSORS=n
 CONFIG_PACKAGE_socat=y
 CONFIG_PACKAGE_ethtool=y
 
+CONFIG_PACKAGE_luci-proto-wireguard=y
+
 # Printing stuff
 CONFIG_PACKAGE_avahi-dbus-daemon=y
 CONFIG_PACKAGE_avahi-utils=y
