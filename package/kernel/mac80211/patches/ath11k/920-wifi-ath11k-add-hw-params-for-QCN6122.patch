@@ -25,7 +25,7 @@ Signed-off-by: George Moussalem <george.moussalem@outlook.com>
 
 --- a/drivers/net/wireless/ath/ath11k/core.c
 +++ b/drivers/net/wireless/ath/ath11k/core.c
-@@ -907,6 +907,67 @@ static struct ath11k_hw_params ath11k_hw
+@@ -907,6 +907,66 @@ static struct ath11k_hw_params ath11k_hw
  		.support_dual_stations = true,
  		.pdev_suspend = false,
  	},
@@ -54,7 +54,6 @@ Signed-off-by: George Moussalem <george.moussalem@outlook.com>
 +			.max_fft_bins = 1024,
 +		},
 +		.credit_flow = false,
-+		.max_tx_ring = 1,
 +		.supports_monitor = true,
 +		.supports_shadow_regs = false,
 +		.idle_ps = false,
