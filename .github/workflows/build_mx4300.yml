@@ -23,6 +23,9 @@ jobs:
                   haskell: true
                   large-packages: true
                   swap-storage: true
+
+            - name: Print CPU
+              run:  lscpu
         
             - name: Install packages
               run: |
