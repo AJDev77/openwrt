@@ -1,4 +1,4 @@
-name: Build Linksys MX4300 Image
+name: Build Linksys MX4300 Image - ARM
 
 on: workflow_dispatch
 
