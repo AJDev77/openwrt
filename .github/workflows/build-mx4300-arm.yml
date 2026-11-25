@@ -4,7 +4,7 @@ on: workflow_dispatch
 
 jobs:
     build:
-        name: Build Linksys MX4300 Images
+        name: Build Linksys MX4300 Images - ARM
         runs-on: ubuntu-24.04-arm
         permissions:
             contents: write
