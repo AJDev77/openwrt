@@ -1,26 +1,42 @@
-From f88f78a83cd6c9f73ea9db4463688a312bad5214 Mon Sep 17 00:00:00 2001
-From: Julius Bairaktaris <julius@bairaktaris.de>
-Date: Mon, 24 Aug 2026 15:38:05 +0200
-Subject: [PATCH ath-next v5 8/9] wifi: ath11k: stop a scheduling round when
- the hardware refuses a frame
+A round dequeues a frame from mac80211 before ath11k_dp_tx() can refuse
+it, and ath11k_mac_tx() then frees it. ath11k_dp_tx() returns -ENOSPC
+when the ring's MSDU idr, DP_TX_IDR_SIZE - 1 ids, is full and -ENOMEM
+when no TCL descriptor is free or a DMA mapping fails. Without airtime
+queue limits, as with aql_enable off, nothing keeps the frames in flight
+below that.
 
-ath11k_dp_tx() returns -ENOSPC when the MSDU idr is full and -ENOMEM
-when no TCL descriptor is free or a DMA mapping fails; it frees the
-frame, and the round then dequeues and frees the next frame of the same
-flow. End the round on those errors and on -ENOSPC from a full
-management queue, leaving the frames behind queued; other errors concern
-only the frame. A category whose round ended this way or on a full TCL
-ring may have nothing in flight, so mark it and start its round from the
-next tx completion on the device.
+Count the ids in use per ring and end the round before a dequeue when
+the idr or the TCL ring has no room, so a frame leaves the queue only
+when it can be sent. A frame refused anyway, because one sent outside a
+round took the last slot, still ends the round and leaves the frames
+behind it queued; other errors concern only the frame. A category whose
+round ended this way may have nothing of its own in flight, so mark it
+and start its round from the next tx completion on the device.
+
+Such a completion is due only while a frame is pending, so the round
+ends only then. It marks the category before it reads the pending
+counts, and tx completion reads the marks after the fully ordered
+decrement of its frame's count, so either the round sees no frame
+pending and goes on, or a completion sees the mark. With no frame
+pending, a refused frame is dropped and the round goes on, as before.
 
 Tested-on: IPQ8074 hw2.0 AHB WLAN.HK.2.9.0.1-02146-QCAHKSWPL_SILICONZ-1
 
-Link: https://lore.kernel.org/all/20261018174904.1757161-9-julius@bairaktaris.de/
-Assisted-by: Claude:claude-opus-5-5
 Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+ drivers/net/wireless/ath/ath11k/core.h  |  2 +
+ drivers/net/wireless/ath/ath11k/dp.c    |  1 +
+ drivers/net/wireless/ath/ath11k/dp.h    |  6 ++-
+ drivers/net/wireless/ath/ath11k/dp_tx.c | 55 +++++++++++++++++++++----
+ drivers/net/wireless/ath/ath11k/dp_tx.h |  1 +
+ drivers/net/wireless/ath/ath11k/mac.c   | 54 ++++++++++++++++++++----
+ 6 files changed, 103 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/core.h b/drivers/net/wireless/ath/ath11k/core.h
+index 40895d276de5f..8b7bfb0cefcf2 100644
 --- a/drivers/net/wireless/ath/ath11k/core.h
 +++ b/drivers/net/wireless/ath/ath11k/core.h
-@@ -718,6 +718,8 @@ struct ath11k {
+@@ -713,6 +713,8 @@ struct ath11k {
  	 * other contexts that drive it
  	 */
  	spinlock_t txq_lock[IEEE80211_NUM_ACS];
@@ -29,15 +45,141 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  
  	struct list_head arvifs;
  	/* should never be NULL; needed for regular htt rx */
+diff --git a/drivers/net/wireless/ath/ath11k/dp.c b/drivers/net/wireless/ath/ath11k/dp.c
+index 3e0a6bdfa0505..615384a4bb75e 100644
+--- a/drivers/net/wireless/ath/ath11k/dp.c
++++ b/drivers/net/wireless/ath/ath11k/dp.c
+@@ -1088,6 +1088,7 @@ int ath11k_dp_alloc(struct ath11k_base *ab)
+ 
+ 	for (i = 0; i < ab->hw_params.hal_params->num_tx_rings; i++) {
+ 		idr_init(&dp->tx_ring[i].txbuf_idr);
++		atomic_set(&dp->tx_ring[i].num_txbuf, 0);
+ 		spin_lock_init(&dp->tx_ring[i].tx_idr_lock);
+ 		spin_lock_init(&dp->tx_ring[i].wake_tx_lock);
+ 		dp->tx_ring[i].tcl_data_ring_id = i;
+diff --git a/drivers/net/wireless/ath/ath11k/dp.h b/drivers/net/wireless/ath/ath11k/dp.h
+index 6d99501aa269c..bf7439e8b37d0 100644
+--- a/drivers/net/wireless/ath/ath11k/dp.h
++++ b/drivers/net/wireless/ath/ath11k/dp.h
+@@ -85,8 +85,12 @@ struct dp_tx_ring {
+ 	struct dp_srng tcl_data_ring;
+ 	struct dp_srng tcl_comp_ring;
+ 	struct idr txbuf_idr;
+-	/* Protects txbuf_idr and num_pending */
++	/* Protects txbuf_idr; num_txbuf changes with it and is read without */
+ 	spinlock_t tx_idr_lock;
++	/* MSDU ids in use, one per frame between ath11k_dp_tx() and its
++	 * completion
++	 */
++	atomic_t num_txbuf;
+ 	/* Serializes wake_tx_queue operations for this ring */
+ 	spinlock_t wake_tx_lock;
+ 	struct hal_wbm_release_ring *tx_status;
+diff --git a/drivers/net/wireless/ath/ath11k/dp_tx.c b/drivers/net/wireless/ath/ath11k/dp_tx.c
+index 0cdc0493f10d2..1c4cb98f89292 100644
 --- a/drivers/net/wireless/ath/ath11k/dp_tx.c
 +++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
-@@ -776,8 +776,16 @@ void ath11k_dp_tx_completion_handler(str
+@@ -79,6 +79,35 @@ enum hal_encrypt_type ath11k_dp_tx_get_encrypt_type(u32 cipher)
+ 	}
+ }
+ 
++/* The caller holds tx_ring->tx_idr_lock. */
++static struct sk_buff *ath11k_dp_tx_idr_remove(struct dp_tx_ring *tx_ring,
++					       int msdu_id)
++{
++	struct sk_buff *msdu;
++
++	msdu = idr_remove(&tx_ring->txbuf_idr, msdu_id);
++	if (msdu)
++		atomic_dec(&tx_ring->num_txbuf);
++
++	return msdu;
++}
++
++/**
++ * ath11k_dp_tx_idr_has_room() - tell whether ath11k_dp_tx() can take a frame
++ * @tx_ring: the ring the frame would go to first
++ *
++ * ath11k_dp_tx() allocates the frame's MSDU id from the ring's idr, which
++ * holds DP_TX_IDR_SIZE - 1 ids and frees one when the frame completes. A
++ * caller that takes a frame from mac80211 only to have it refused for a full
++ * idr loses the frame, so it checks first.
++ *
++ * Return: true if the idr has an id free.
++ */
++bool ath11k_dp_tx_idr_has_room(struct dp_tx_ring *tx_ring)
++{
++	return atomic_read(&tx_ring->num_txbuf) < DP_TX_IDR_SIZE - 1;
++}
++
+ int ath11k_dp_tx(struct ath11k *ar, struct ath11k_vif *arvif,
+ 		 struct ath11k_sta *arsta, struct sk_buff *skb)
+ {
+@@ -123,6 +152,8 @@ int ath11k_dp_tx(struct ath11k *ar, struct ath11k_vif *arvif,
+ 	spin_lock_bh(&tx_ring->tx_idr_lock);
+ 	ret = idr_alloc(&tx_ring->txbuf_idr, skb, 0,
+ 			DP_TX_IDR_SIZE - 1, GFP_ATOMIC);
++	if (likely(ret >= 0))
++		atomic_inc(&tx_ring->num_txbuf);
+ 	spin_unlock_bh(&tx_ring->tx_idr_lock);
+ 
+ 	if (unlikely(ret < 0)) {
+@@ -274,8 +305,8 @@ int ath11k_dp_tx(struct ath11k *ar, struct ath11k_vif *arvif,
+ 
+ fail_remove_idr:
+ 	spin_lock_bh(&tx_ring->tx_idr_lock);
+-	idr_remove(&tx_ring->txbuf_idr,
+-		   FIELD_GET(DP_TX_DESC_ID_MSDU_ID, ti.desc_id));
++	ath11k_dp_tx_idr_remove(tx_ring,
++				FIELD_GET(DP_TX_DESC_ID_MSDU_ID, ti.desc_id));
+ 	spin_unlock_bh(&tx_ring->tx_idr_lock);
+ 
+ 	if (tcl_ring_retry)
+@@ -294,7 +325,7 @@ static void ath11k_dp_tx_free_txbuf(struct ath11k_base *ab, u8 mac_id,
+ 	struct ath11k_skb_cb *skb_cb;
+ 
+ 	spin_lock(&tx_ring->tx_idr_lock);
+-	msdu = idr_remove(&tx_ring->txbuf_idr, msdu_id);
++	msdu = ath11k_dp_tx_idr_remove(tx_ring, msdu_id);
+ 	spin_unlock(&tx_ring->tx_idr_lock);
+ 
+ 	if (unlikely(!msdu)) {
+@@ -338,7 +369,7 @@ void ath11k_dp_tx_free_pending(struct ath11k_base *ab)
+ 
+ 		spin_lock_bh(&tx_ring->tx_idr_lock);
+ 		idr_for_each_entry(&tx_ring->txbuf_idr, msdu, msdu_id) {
+-			idr_remove(&tx_ring->txbuf_idr, msdu_id);
++			ath11k_dp_tx_idr_remove(tx_ring, msdu_id);
+ 			__skb_queue_tail(&pending, msdu);
+ 		}
+ 		spin_unlock_bh(&tx_ring->tx_idr_lock);
+@@ -366,7 +397,7 @@ ath11k_dp_tx_htt_tx_complete_buf(struct ath11k_base *ab,
+ 	struct ath11k_peer *peer;
+ 
+ 	spin_lock(&tx_ring->tx_idr_lock);
+-	msdu = idr_remove(&tx_ring->txbuf_idr, ts->msdu_id);
++	msdu = ath11k_dp_tx_idr_remove(tx_ring, ts->msdu_id);
+ 	spin_unlock(&tx_ring->tx_idr_lock);
+ 
+ 	if (unlikely(!msdu)) {
+@@ -795,7 +826,7 @@ void ath11k_dp_tx_completion_handler(struct ath11k_base *ab, int ring_id)
+ 		}
+ 
+ 		spin_lock(&tx_ring->tx_idr_lock);
+-		msdu = idr_remove(&tx_ring->txbuf_idr, msdu_id);
++		msdu = ath11k_dp_tx_idr_remove(tx_ring, msdu_id);
+ 		if (unlikely(!msdu)) {
+ 			ath11k_warn(ab, "tx completion for unknown msdu_id %d\n",
+ 				    msdu_id);
+@@ -818,8 +849,18 @@ void ath11k_dp_tx_completion_handler(struct ath11k_base *ab, int ring_id)
  	/* A completion returns the airtime the frame was charged, which is
  	 * what an airtime-limited station in that access category is waiting
  	 * on. The arrivals that would otherwise start a round are themselves
 -	 * queued behind that limit.
 +	 * queued behind that limit. It also frees the ring space and MSDU ids
-+	 * that a round ended early on any radio is waiting on.
++	 * that a round ended early on any radio is waiting on. The fully
++	 * ordered decrement of num_tx_pending orders the read of the mark
++	 * after the frame is counted done.
  	 */
 +	for (i = 0; i < ab->num_radios; i++) {
 +		ar = ab->pdevs[i].ar;
@@ -49,9 +191,23 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  	for_each_set_bit(i, &push, ab->num_radios * IEEE80211_NUM_ACS)
  		ath11k_mac_tx_push_pending(ab->pdevs[i / IEEE80211_NUM_ACS].ar,
  					   i % IEEE80211_NUM_ACS);
+diff --git a/drivers/net/wireless/ath/ath11k/dp_tx.h b/drivers/net/wireless/ath/ath11k/dp_tx.h
+index 9a26de411e83a..f82df5d2f6033 100644
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.h
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.h
+@@ -21,6 +21,7 @@ void ath11k_dp_tx_update_txcompl(struct ath11k *ar, struct hal_tx_status *ts);
+ int ath11k_dp_tx_htt_h2t_ver_req_msg(struct ath11k_base *ab);
+ int ath11k_dp_tx(struct ath11k *ar, struct ath11k_vif *arvif,
+ 		 struct ath11k_sta *arsta, struct sk_buff *skb);
++bool ath11k_dp_tx_idr_has_room(struct dp_tx_ring *tx_ring);
+ void ath11k_dp_tx_completion_handler(struct ath11k_base *ab, int ring_id);
+ void ath11k_dp_tx_free_pending(struct ath11k_base *ab);
+ int ath11k_dp_tx_send_reo_cmd(struct ath11k_base *ab, struct dp_rx_tid *rx_tid,
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index d17f80cbcdb5d..a0f1451a8fafe 100644
 --- a/drivers/net/wireless/ath/ath11k/mac.c
 +++ b/drivers/net/wireless/ath/ath11k/mac.c
-@@ -6500,9 +6500,9 @@ static int ath11k_mac_mgmt_tx(struct ath
+@@ -6519,9 +6519,9 @@ static int ath11k_mac_mgmt_tx(struct ath11k *ar, struct sk_buff *skb,
  	return 0;
  }
  
@@ -64,7 +220,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  {
  	struct ath11k_skb_cb *skb_cb = ATH11K_SKB_CB(skb);
  	struct ath11k *ar = hw->priv;
-@@ -6534,7 +6534,7 @@ static void ath11k_mac_op_tx(struct ieee
+@@ -6553,7 +6553,7 @@ static void ath11k_mac_op_tx(struct ieee80211_hw *hw,
  				    ret);
  			ieee80211_free_txskb(ar->hw, skb);
  		}
@@ -73,7 +229,7 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  	}
  
  	if (control->sta)
-@@ -6545,6 +6545,15 @@ static void ath11k_mac_op_tx(struct ieee
+@@ -6564,6 +6564,15 @@ static void ath11k_mac_op_tx(struct ieee80211_hw *hw,
  		ath11k_warn(ar->ab, "failed to transmit frame %d\n", ret);
  		ieee80211_free_txskb(ar->hw, skb);
  	}
@@ -89,7 +245,34 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  }
  
  void ath11k_mac_drain_tx(struct ath11k *ar)
-@@ -10094,6 +10103,7 @@ static int ath11k_mac_tx_push_txq(struct
+@@ -10079,6 +10088,26 @@ static int ath11k_mac_op_sta_state(struct ieee80211_hw *hw,
+ 	return ret;
+ }
+ 
++/* A round that stops for lack of room is restarted by the next tx completion
++ * on the device, which reads the mark after counting its frame done. Mark
++ * first, then check that a frame is still pending, or no completion is due.
++ */
++static bool ath11k_mac_mark_txq_starved(struct ath11k *ar, u8 ac)
++{
++	struct ath11k_base *ab = ar->ab;
++	int i;
++
++	set_bit(ac, &ar->txq_starved);
++	/* pairs with the decrement of num_tx_pending in tx completion */
++	smp_mb__after_atomic();
++
++	for (i = 0; i < ab->num_radios; i++)
++		if (atomic_read(&ab->pdevs[i].ar->dp.num_tx_pending))
++			return true;
++
++	return false;
++}
++
+ static int ath11k_mac_tx_push_txq(struct ath11k *ar, struct ieee80211_txq *txq)
+ {
+ 	struct ieee80211_tx_control control = {
+@@ -10090,6 +10119,7 @@ static int ath11k_mac_tx_push_txq(struct ath11k *ar, struct ieee80211_txq *txq)
  	struct sk_buff *skb;
  	u32 ring_selector;
  	int num_free;
@@ -97,17 +280,32 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  	u8 ring_id;
  
  	ring_selector = ar->ab->hw_params.hw_ops->get_ring_selector(txq->ac);
-@@ -10103,7 +10113,8 @@ static int ath11k_mac_tx_push_txq(struct
+@@ -10099,7 +10129,9 @@ static int ath11k_mac_tx_push_txq(struct ath11k *ar, struct ieee80211_txq *txq)
  
  	/* ieee80211_tx_dequeue() applies the airtime queue limit, so a
  	 * selection ends where that limit binds or the queue empties. A full
 -	 * TCL ring ends the whole round.
-+	 * TCL ring ends the whole round, and so does a frame the hardware
-+	 * refuses.
++	 * TCL ring or MSDU idr ends the whole round before a frame is taken
++	 * from the queue, and so does a frame the hardware refuses anyway,
++	 * as long as a frame in flight will restart it.
  	 */
  	while (1) {
  		if (unlikely(test_bit(ATH11K_FLAG_CRASH_FLUSH,
-@@ -10127,9 +10138,12 @@ static int ath11k_mac_tx_push_txq(struct
+@@ -10112,9 +10144,11 @@ static int ath11k_mac_tx_push_txq(struct ath11k *ar, struct ieee80211_txq *txq)
+ 		num_free = ath11k_hal_srng_src_num_free(ar->ab, tcl_ring, true);
+ 		spin_unlock_bh(&tcl_ring->lock);
+ 
+-		if (num_free == 0) {
++		if (num_free == 0 || !ath11k_dp_tx_idr_has_room(tx_ring)) {
+ 			spin_unlock_bh(&tx_ring->wake_tx_lock);
+-			return -ENOSPC;
++			if (ath11k_mac_mark_txq_starved(ar, txq->ac))
++				return -ENOSPC;
++			continue;
+ 		}
+ 
+ 		skb = ieee80211_tx_dequeue(hw, txq);
+@@ -10123,9 +10157,13 @@ static int ath11k_mac_tx_push_txq(struct ath11k *ar, struct ieee80211_txq *txq)
  			break;
  		}
  
@@ -116,20 +314,9 @@ Signed-off-by: Julius Bairaktaris <julius@bairaktaris.de>
  
  		spin_unlock_bh(&tx_ring->wake_tx_lock);
 +
-+		if (unlikely(ret == -ENOSPC || ret == -ENOMEM))
++		if (unlikely(ret == -ENOSPC || ret == -ENOMEM) &&
++		    ath11k_mac_mark_txq_starved(ar, txq->ac))
 +			return ret;
  	}
  
  	return 0;
-@@ -10147,8 +10161,10 @@ static void ath11k_mac_schedule_txq(stru
- 		int ret = ath11k_mac_tx_push_txq(ar, txq);
- 
- 		ieee80211_return_txq(hw, txq, false);
--		if (unlikely(ret))
-+		if (unlikely(ret)) {
-+			set_bit(ac, &ar->txq_starved);
- 			break;
-+		}
- 	}
- 	ieee80211_txq_schedule_end(hw, ac);
- 
