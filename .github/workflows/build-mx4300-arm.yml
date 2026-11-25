@@ -1,0 +1,91 @@
+name: Build Linksys MX4300 Image
+
+on: workflow_dispatch
+
+jobs:
+    build:
+        name: Build Linksys MX4300 Images
+        runs-on: ubuntu-24.04-arm
+        permissions:
+            contents: write
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.ref }}
+
+            - name: Free Disk Space (Ubuntu)
+              uses: jlumbroso/free-disk-space@main
+              with:
+                  tool-cache: false
+                  android: true
+                  dotnet: true
+                  haskell: true
+                  large-packages: true
+                  swap-storage: true
+
+            - name: Output CPU
+              run:  lscpu
+        
+            - name: Install packages
+              run: |
+                  sudo apt-get update && \
+                  sudo apt install -y build-essential \
+                  clang \
+                  flex \
+                  bison \
+                  g++ \
+                  gawk \
+                  gcc-multilib \
+                  g++-multilib \
+                  gettext \
+                  git \
+                  libncurses5-dev \
+                  libssl-dev \
+                  python3-setuptools \
+                  rsync \
+                  swig \
+                  unzip \
+                  zlib1g-dev \
+                  libglib2.0-dev-bin \
+                  file \
+                  wget && \
+                  sudo apt-get clean
+
+            - name: Add cups feed
+              run: cp feeds.conf.default feeds.conf && echo "src-git printing https://github.com/AJDev77/openwrt-printing-packages.git" >> feeds.conf
+
+            - name: Update feeds
+              run:  scripts/feeds update -a && scripts/feeds install -a
+
+            - name: Generate config
+              run:  cp config-seed.seed .config
+
+            - name: Modify config
+              run: sed -i 's/# CONFIG_TARGET_qualcommax_ipq807x_DEVICE_linksys_mx4300 is not set/CONFIG_TARGET_qualcommax_ipq807x_DEVICE_linksys_mx4300=y/g' .config
+
+            - name: Print
+              run:  cat .config
+
+            - name: Generate full config
+              run:  make defconfig
+
+            - name: Print final config we are using
+              run: cat .config
+
+            - name: Pre-download
+              run: make download -j$(($(nproc)+1))
+
+            - name: Build firmware images
+              run: make -j$(($(nproc)+1)) V=s
+
+            - name: Get SHA
+              uses: benjlevesque/short-sha@v2.2
+
+            - name: Release
+              uses: ncipollo/release-action@v1
+              with:
+                tag: mx4x00-${{ env.SHA }}
+                commit: ${{ github.event.ref }}
+                allowUpdates: true
+                artifacts: bin/targets/qualcommax/ipq807x/openwrt*-qualcommax-ipq807x-linksys_mx4*
