@@ -36,8 +36,6 @@ jobs:
                   bison \
                   g++ \
                   gawk \
-                  gcc-multilib \
-                  g++-multilib \
                   gettext \
                   git \
                   libncurses5-dev \
